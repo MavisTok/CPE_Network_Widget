@@ -1,26 +1,30 @@
 /**
- * 烽火CPE状态小组件 - Egern Widget
+ * 烽火/中兴 CPE 状态小组件 - Egern Widget
  *
  * 环境变量:
- *   CPE_HOST  CPE管理地址，默认 192.168.8.1
- *   CPE_USER  登录用户名，默认 useradmin
- *   CPE_PASS  登录密码，默认 空
- *   CPE_API   API前缀，'api'(LG6121F) 或 'fh_api'(其他型号)，默认自动检测
+ *   CPE_HOST  FH管理地址，默认 192.168.8.1
+ *   CPE_USER  FH登录用户名，默认 useradmin
+ *   CPE_PASS  FH登录密码，默认 空
+ *   CPE_API   FH API前缀，'api'(LG6121F) 或 'fh_api'(其他型号)，默认自动检测
+ *   ZTE_HOST  ZTE管理地址，默认 192.168.0.1
+ *   ZTE_PASS  ZTE管理密码（留空则用免登录 token 读取数据）
+ *   CPE_TYPE  强制设备类型: 'fh' | 'zte' | 'auto'（默认 auto）
  *
- * 参考: github.com/Curtion/fiberhome-cpe-lg6121f-sms-notice
- *   加密: AES-128-CBC, key=sessionid前16字节, IV=bytes(112..127)
- *   body: hex(AES_CBC_PKCS7({"dataObj":...,"ajaxmethod":"...","sessionid":"..."}))
- *   响应: hex → AES_CBC 解密 → JSON
+ * FH 参考: github.com/Curtion/fiberhome-cpe-lg6121f-sms-notice
+ * ZTE 参考: github.com/MavisTok/ZTE_Desktop_Status
  */
 
 // ==================== 配置 ====================
 
 function getConfig(ctx) {
   return {
-    host: ctx.env.CPE_HOST || '192.168.8.1',
-    user: ctx.env.CPE_USER || 'useradmin',
-    pass: ctx.env.CPE_PASS || '',
-    api:  ctx.env.CPE_API  || '',   // '' = 自动检测
+    host:    ctx.env.CPE_HOST  || '192.168.8.1',
+    user:    ctx.env.CPE_USER  || 'useradmin',
+    pass:    ctx.env.CPE_PASS  || '',
+    api:     ctx.env.CPE_API   || '',
+    zteHost: ctx.env.ZTE_HOST  || '192.168.0.1',
+    ztePass: ctx.env.ZTE_PASS  || '',
+    cpeType: ctx.env.CPE_TYPE  || 'auto',
   };
 }
 
@@ -336,6 +340,190 @@ async function login(ctx, cfg) {
   throw new Error('登录失败: 请检查 CPE_USER / CPE_PASS 配置');
 }
 
+// ==================== ZTE ubus API ====================
+
+const ZTE_ANON = '00000000000000000000000000000000';
+
+/** 中兴 ubus JSON-RPC 批量请求 */
+async function ztePost(ctx, cfg, calls, token) {
+  const tok = token || ZTE_ANON;
+  const body = JSON.stringify(calls.map((c, i) => ({
+    jsonrpc: '2.0', id: i + 1, method: 'call',
+    params: [tok, c.obj, c.fn, c.args || {}],
+  })));
+  const resp = await ctx.http.post(
+    `http://${cfg.zteHost}/ubus/?t=${Date.now()}`,
+    { headers: { 'Content-Type': 'application/json' }, body }
+  );
+  const text = await resp.text();
+  const arr = JSON.parse(text);
+  return arr.map(r => (r.result?.[0] === 0 ? r.result[1] : null));
+}
+
+/** SHA-256 纯 JS 实现（用于 ZTE 登录密码哈希）*/
+function sha256(msgStr) {
+  const K = [
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+  ];
+  const bytes = [];
+  for (let i = 0; i < msgStr.length; i++) {
+    const c = msgStr.charCodeAt(i);
+    if (c < 0x80) bytes.push(c);
+    else if (c < 0x800) bytes.push(0xc0|(c>>6), 0x80|(c&0x3f));
+    else bytes.push(0xe0|(c>>12), 0x80|((c>>6)&0x3f), 0x80|(c&0x3f));
+  }
+  bytes.push(0x80);
+  while ((bytes.length % 64) !== 56) bytes.push(0);
+  const bitLen = (msgStr.length * 8);
+  bytes.push(0,0,0,0, (bitLen>>>24)&0xff,(bitLen>>>16)&0xff,(bitLen>>>8)&0xff,bitLen&0xff);
+  let [h0,h1,h2,h3,h4,h5,h6,h7] = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  const rotr = (x,n) => (x>>>n)|(x<<(32-n));
+  for (let i = 0; i < bytes.length; i += 64) {
+    const w = new Uint32Array(64);
+    for (let j = 0; j < 16; j++) w[j] = (bytes[i+j*4]<<24)|(bytes[i+j*4+1]<<16)|(bytes[i+j*4+2]<<8)|bytes[i+j*4+3];
+    for (let j = 16; j < 64; j++) {
+      const s0 = rotr(w[j-15],7)^rotr(w[j-15],18)^(w[j-15]>>>3);
+      const s1 = rotr(w[j-2],17)^rotr(w[j-2],19)^(w[j-2]>>>10);
+      w[j] = (w[j-16]+s0+w[j-7]+s1) >>> 0;
+    }
+    let [a,b,c,d,e,f,g,h] = [h0,h1,h2,h3,h4,h5,h6,h7];
+    for (let j = 0; j < 64; j++) {
+      const S1 = rotr(e,6)^rotr(e,11)^rotr(e,25);
+      const ch = (e&f)^(~e&g);
+      const t1 = (h+S1+ch+K[j]+w[j]) >>> 0;
+      const S0 = rotr(a,2)^rotr(a,13)^rotr(a,22);
+      const maj = (a&b)^(a&c)^(b&c);
+      const t2 = (S0+maj) >>> 0;
+      [h,g,f,e,d,c,b,a] = [g,f,e,(d+t1)>>>0,c,b,a,(t1+t2)>>>0];
+    }
+    h0=(h0+a)>>>0; h1=(h1+b)>>>0; h2=(h2+c)>>>0; h3=(h3+d)>>>0;
+    h4=(h4+e)>>>0; h5=(h5+f)>>>0; h6=(h6+g)>>>0; h7=(h7+h)>>>0;
+  }
+  return [h0,h1,h2,h3,h4,h5,h6,h7].map(v=>v.toString(16).padStart(8,'0')).join('').toUpperCase();
+}
+
+/** ZTE 登录（若 ztePass 为空则使用匿名 token）*/
+async function zteLogin(ctx, cfg) {
+  if (!cfg.ztePass) return ZTE_ANON;
+  const [[info]] = [await ztePost(ctx, cfg, [{ obj:'zwrt_web', fn:'web_login_info', args:{} }])];
+  const salt = info?.zte_web_sault || '';
+  const h1 = sha256(cfg.ztePass);
+  const h2 = sha256(h1 + salt);
+  const [[res]] = [await ztePost(ctx, cfg, [{ obj:'zwrt_web', fn:'web_login', args:{ password: h2 } }])];
+  if (!res?.ubus_rpc_session) throw new Error('ZTE 登录失败');
+  return res.ubus_rpc_session;
+}
+
+/** ZTE 数据获取 */
+async function fetchZteData(ctx, cfg) {
+  const cachedTok = ctx.storage.get('zte_token') || ZTE_ANON;
+  let tok = cachedTok;
+
+  const calls = [
+    { obj:'zte_nwinfo_api',   fn:'nwinfo_get_netinfo',  args:{} },
+    { obj:'zwrt_data',        fn:'get_wwandst',         args:{ source_module:'web', cid:1, type:4 } },
+    { obj:'zwrt_data',        fn:'get_wwaniface',       args:{ source_module:'web', cid:1, connect_status:'' } },
+  ];
+
+  let [nw, spd, iface] = await ztePost(ctx, cfg, calls, tok);
+
+  // 若 token 过期，重新登录
+  if (!nw) {
+    tok = await zteLogin(ctx, cfg);
+    ctx.storage.set('zte_token', tok);
+    [nw, spd, iface] = await ztePost(ctx, cfg, calls, tok);
+  }
+
+  nw = nw || {}; spd = spd || {}; iface = iface || {};
+
+  // 优先取 5G 字段，回退 LTE
+  const band   = nw.nr5g_action_band  || nw.wan_active_band || nw.lte_band || null;
+  const pci    = nw.nr5g_pci          || nw.lte_pci         || null;
+  const rsrp   = parseFloat(nw.nr5g_rsrp   || nw.lte_rsrp)  || null;
+  const rsrq   = parseFloat(nw.nr5g_rsrq   || nw.lte_rsrq)  || null;
+  const sinr   = parseFloat(nw.nr5g_sinr   || nw.nr5g_snr || nw.lte_sinr || nw.lte_snr) || null;
+  const rssi   = parseFloat(nw.lte_rssi)   || null;
+  const cellId = nw.nr5g_cell_id || nw.lte_cell_id || null;
+
+  return {
+    brand: 'ZTE',
+    wan: {
+      ip:         iface.ipv4_address || '--',
+      gateway:    '--',
+      dns:        iface.ipv4_dns_prefer || '--',
+      connType:   nw.network_type || 'CPE',
+      carrier:    nw.network_provider_fullname || '',
+      connected:  iface.connect_status === 'connected' || iface.connect_status === 1,
+      onlineDevs: 0,
+    },
+    traffic: {
+      txBytes: Number(spd.real_tx_bytes || spd.total_tx_bytes) || 0,
+      rxBytes: Number(spd.real_rx_bytes || spd.total_rx_bytes) || 0,
+      txSpeed: Number(spd.real_tx_speed) || 0,
+      rxSpeed: Number(spd.real_rx_speed) || 0,
+    },
+    signal: {
+      band:       band ? String(band).replace(/^N/i,'') : null,
+      pci:        pci != null ? String(pci) : null,
+      rsrp, rsrq, sinr, rssi,
+      power:      null,
+      cqi:        null,
+      qci:        null,
+      cellId:     cellId ? String(cellId) : null,
+      signalLevel: Number(nw.signalbar) || null,
+    },
+  };
+}
+
+// ==================== 设备类型检测 ====================
+
+/**
+ * 检测连接的是 FH 还是 ZTE 设备
+ * 结果缓存在 storage，避免每次都探测
+ */
+async function detectDevice(ctx, cfg) {
+  if (cfg.cpeType === 'fh')  return 'fh';
+  if (cfg.cpeType === 'zte') return 'zte';
+
+  const cached = ctx.storage.get('device_type');
+  if (cached === 'fh' || cached === 'zte') return cached;
+
+  // 先探 FH（sessionid 接口）
+  for (const base of ['/api/tmp', '/fh_api/tmp']) {
+    try {
+      const r = await ctx.http.get(
+        `http://${cfg.host}${base}/FHNCAPIS?ajaxmethod=get_refresh_sessionid`,
+        { headers: { 'X-Requested-With': 'XMLHttpRequest' } }
+      );
+      const t = await r.text();
+      if (t.includes('sessionid')) {
+        cfg._apiBase = base;
+        ctx.storage.set('device_type', 'fh');
+        return 'fh';
+      }
+    } catch (_) {}
+  }
+
+  // 再探 ZTE（ubus 匿名接口）
+  try {
+    const [nw] = await ztePost(ctx, cfg, [{ obj:'zte_nwinfo_api', fn:'nwinfo_get_netinfo', args:{} }]);
+    if (nw && nw.network_type !== undefined) {
+      ctx.storage.set('device_type', 'zte');
+      return 'zte';
+    }
+  } catch (_) {}
+
+  // 默认 FH
+  return 'fh';
+}
+
 // ==================== 数据获取 ====================
 
 /**
@@ -352,7 +540,7 @@ const NETWORK_MODE_MAP = {
   '0':'2G', '1':'3G', '2':'4G LTE', '3':'5G NSA', '4':'5G SA', '5':'5G',
 };
 
-async function fetchAllData(ctx, cfg) {
+async function fetchFhData(ctx, cfg) {
   // 确保 API base 已检测
   if (!cfg._apiBase) await detectApiBase(ctx, cfg);
 
@@ -424,12 +612,23 @@ async function fetchAllData(ctx, cfg) {
       cellId: String(nr.CellId ?? nr.CELLID ?? nr['CELL ID'] ?? h.CellId ?? '') || null,
       signalLevel: Number(h.SignalLevel) || null,
     },
+    brand: 'FH',
   };
+}
+
+async function fetchAllData(ctx, cfg) {
+  const type = await detectDevice(ctx, cfg);
+  if (type === 'zte') return await fetchZteData(ctx, cfg);
+  return await fetchFhData(ctx, cfg);
 }
 
 // ==================== 速率计算 ====================
 
 function calcSpeed(ctx, traffic) {
+  // ZTE 直接提供实时速率（单位 Bps）
+  if (traffic.txSpeed != null || traffic.rxSpeed != null) {
+    return { up: traffic.txSpeed || 0, down: traffic.rxSpeed || 0 };
+  }
   const now  = Date.now();
   const prev = ctx.storage.getJSON('prev_traffic');
   ctx.storage.setJSON('prev_traffic', { ...traffic, ts: now });
@@ -520,12 +719,20 @@ const speedBlock = (dir, bps, color) => {
   };
 };
 
-const titleRow = (wan, sig, sz) => ({
+const brandBadge = (brand) => ({
+  type:'text', text:brand, font:{size:'caption2',weight:'bold'},
+  textColor: brand==='ZTE' ? '#F7B731' : '#5EC4E8',
+  backgroundColor: brand==='ZTE' ? '#2A2000' : '#0A1E2E',
+  padding:[1,5], borderRadius:4,
+});
+
+const titleRow = (wan, sig, sz, brand) => ({
   type:'stack', direction:'row', alignItems:'center', gap:6,
   children:[
     { type:'image', src:'sf-symbol:antenna.radiowaves.left.and.right', color:C.title, width:sz, height:sz },
     { type:'text', text:wan.carrier||wan.connType, font:{size:'headline',weight:'bold'}, textColor:C.title },
     { type:'spacer' },
+    brandBadge(brand || 'FH'),
     dot(sig.rsrp, 10),
     { type:'text', text:sig.band?`N${sig.band}`:wan.connType, font:{size:'caption2',weight:'medium'}, textColor:C.dim, backgroundColor:C.bg2, padding:[2,6], borderRadius:4 },
   ],
@@ -535,7 +742,7 @@ const titleRow = (wan, sig, sz) => ({
 
 const BG = { type:'linear', colors:[C.bg1,'#0D1520'], startPoint:{x:0,y:0}, endPoint:{x:0.5,y:1} };
 
-function buildSmall(wan, speed, sig) {
+function buildSmall(wan, speed, sig, brand) {
   const f = (v,u) => v != null ? `${v} ${u}` : '--';
   return {
     type:'widget', backgroundGradient:BG, padding:12, gap:6,
@@ -544,6 +751,7 @@ function buildSmall(wan, speed, sig) {
         { type:'image', src:'sf-symbol:antenna.radiowaves.left.and.right', color:C.title, width:15, height:15 },
         { type:'text', text:wan.carrier||wan.connType, font:{size:'caption1',weight:'bold'}, textColor:C.title, maxLines:1, minScale:0.7 },
         { type:'spacer' },
+        brandBadge(brand || 'FH'),
         dot(sig.rsrp, 10),
       ]},
       infoRow('dot.radiowaves.right', 'BAND', sig.band?`N${sig.band}`:'--'),
@@ -555,12 +763,12 @@ function buildSmall(wan, speed, sig) {
   };
 }
 
-function buildMedium(wan, speed, sig) {
+function buildMedium(wan, speed, sig, brand) {
   const f = (v,u) => v != null ? `${v} ${u}` : '--';
   return {
     type:'widget', backgroundGradient:BG, padding:14, gap:6,
     children:[
-      titleRow(wan, sig, 17),
+      titleRow(wan, sig, 17, brand),
       { type:'stack', direction:'row', gap:12, flex:1, children:[
         { type:'stack', direction:'column', gap:4, flex:1, children:[
           infoRow('dot.radiowaves.right', 'BAND', sig.band?`N${sig.band}`:'--'),
@@ -583,12 +791,12 @@ function buildMedium(wan, speed, sig) {
   };
 }
 
-function buildLarge(wan, speed, sig) {
+function buildLarge(wan, speed, sig, brand) {
   const f = (v,u) => v != null ? `${v} ${u}` : '--';
   return {
     type:'widget', backgroundGradient:BG, padding:16, gap:8,
     children:[
-      titleRow(wan, sig, 22),
+      titleRow(wan, sig, 22, brand),
       { type:'stack', direction:'row', gap:12, children:[speedBlock('up',speed.up,C.up), speedBlock('down',speed.down,C.down)] },
       { type:'stack', height:1, backgroundColor:C.bg2 },
       { type:'stack', direction:'column', gap:5, children:[
@@ -641,11 +849,11 @@ function buildError(msg) {
     children:[
       { type:'stack', direction:'row', alignItems:'center', gap:6, children:[
         { type:'image', src:'sf-symbol:exclamationmark.triangle.fill', color:'#FF6B6B', width:18, height:18 },
-        { type:'text', text:'烽火CPE', font:{size:'headline',weight:'bold'}, textColor:C.title },
+        { type:'text', text:'FH/ZTE CPE', font:{size:'headline',weight:'bold'}, textColor:C.title },
       ]},
       { type:'spacer' },
       { type:'text', text:msg, font:{size:'caption1'}, textColor:'#FF6B6B' },
-      { type:'text', text:'请设置 CPE_HOST / CPE_USER / CPE_PASS', font:{size:'caption2'}, textColor:C.dim },
+      { type:'text', text:'请设置 CPE_HOST/ZTE_HOST 及账号密码', font:{size:'caption2'}, textColor:C.dim },
     ],
   };
 }
@@ -655,16 +863,16 @@ function buildError(msg) {
 export default async function(ctx) {
   const cfg = getConfig(ctx);
   try {
-    const { wan, traffic, signal } = await fetchAllData(ctx, cfg);
+    const { wan, traffic, signal, brand } = await fetchAllData(ctx, cfg);
     const speed = calcSpeed(ctx, traffic);
     const f = ctx.widgetFamily;
     if (f==='accessoryRectangular'||f==='accessoryInline'||f==='accessoryCircular')
       return buildAccessory(speed, signal);
     if (f==='systemLarge'||f==='systemExtraLarge')
-      return buildLarge(wan, speed, signal);
+      return buildLarge(wan, speed, signal, brand);
     if (f==='systemMedium')
-      return buildMedium(wan, speed, signal);
-    return buildSmall(wan, speed, signal);
+      return buildMedium(wan, speed, signal, brand);
+    return buildSmall(wan, speed, signal, brand);
   } catch(e) {
     return buildError(e.message || '连接失败');
   }
