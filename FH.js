@@ -228,12 +228,18 @@ function referer(host) {
   return { ...COMMON_HEADERS, 'Referer': `http://${host}/main.html` };
 }
 
-/** GET 请求，若返回 HTML 则抛出登录错误 */
+/** GET 请求，若返回 HTML 或非 JSON 则抛出登录错误 */
 async function fhGet(ctx, cfg, path) {
   const resp = await ctx.http.get(`http://${cfg.host}${path}`, { headers: referer(cfg.host) });
   const text = await resp.text();
-  if (text.trim().startsWith('<')) throw new Error('AUTH_REQUIRED');
-  return JSON.parse(text);
+  const t = text.trim();
+  if (t.startsWith('<') || t === '' || t === '0') throw new Error('AUTH_REQUIRED');
+  try {
+    return JSON.parse(t);
+  } catch {
+    // 非 JSON（如加密 hex 或错误文本）→ 需要登录
+    throw new Error('AUTH_REQUIRED');
+  }
 }
 
 /**
@@ -354,13 +360,19 @@ async function fetchAllData(ctx, cfg) {
 
   // 直接尝试获取数据；若需要登录再登录（避免依赖 IS_LOGGED_IN 端点）
   let h = {};
+  const needsLogin = async () => {
+    await login(ctx, cfg);
+    try { h = await fhGet(ctx, cfg, `${base}/FHAPIS?ajaxmethod=get_header_info`); } catch (_) {}
+  };
   try {
     h = await fhGet(ctx, cfg, `${base}/FHAPIS?ajaxmethod=get_header_info`);
-  } catch (e) {
-    if (e.message === 'AUTH_REQUIRED') {
-      await login(ctx, cfg);
-      try { h = await fhGet(ctx, cfg, `${base}/FHAPIS?ajaxmethod=get_header_info`); } catch (_) {}
+    // 验证返回值是否包含预期字段；若没有说明未登录
+    if (!h || typeof h !== 'object' || (!h.NetworkMode && !h.SPN && !h.SignalLevel)) {
+      await needsLogin();
     }
+  } catch (e) {
+    if (e.message === 'AUTH_REQUIRED') await needsLogin();
+    // 其他网络错误保持 h = {} 继续渲染
   }
 
   // POST 获取 NR 信号详情（多个候选方法名，取第一个成功的）
