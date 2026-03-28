@@ -294,20 +294,12 @@ async function getSessionId(ctx, cfg) {
   return data.sessionid;
 }
 
-async function isLoggedIn(ctx, cfg) {
-  try {
-    const base = cfg._apiBase || '/fh_api/tmp';
-    const r = await ctx.http.get(`http://${cfg.host}${base}/IS_LOGGED_IN`, { headers: referer(cfg.host) });
-    const t = await r.text();
-    return t.trim() !== '0' && !t.trim().startsWith('<');
-  } catch { return false; }
-}
-
 /**
  * 登录流程:
  * 1. get_refresh_sessionid → sid
  * 2. POST DO_WEB_LOGIN (AES-CBC 加密)
- * 响应码: 0=成功, 1=被踢, 2=锁定, 3=禁用, 4=密码错, 5=未知
+ * 3. 验证登录: 尝试 get_header_info，成功则登录有效
+ *    （设备响应为大块加密 hex，不能依赖 "0|..." 明文格式）
  */
 async function login(ctx, cfg) {
   const sid = await getSessionId(ctx, cfg);
@@ -319,20 +311,23 @@ async function login(ctx, cfg) {
     `${base}/FHNCAPIS?_${Math.random().toString().slice(2)}`,
   ];
 
-  let lastErr;
   for (const path of loginPaths) {
     try {
-      const result = await fhPost(ctx, cfg, path, 'DO_WEB_LOGIN',
+      await fhPost(ctx, cfg, path, 'DO_WEB_LOGIN',
         { username: cfg.user, password: cfg.pass }, sid);
-      const code = String(result).split('|')[0];
-      if (code === '0') return;
-      const msgs = { '1':'已有用户登录','2':'密码错误超限','3':'账号禁用','4':'密码错误','5':'未知错误' };
-      throw new Error(`登录失败: ${msgs[code] || code}`);
-    } catch (e) {
-      lastErr = e;
-    }
+      // 不解析响应码——设备返回大块加密数据而非 "0|..."
+      // 验证方式：尝试获取 header_info，若成功则认为已登录
+      try {
+        const check = await fhGet(ctx, cfg, `${base}/FHAPIS?ajaxmethod=get_header_info`);
+        if (check && typeof check === 'object') return; // 登录成功
+      } catch (e) {
+        if (e.message === 'AUTH_REQUIRED') continue; // 此路径失败，换下一个
+        // 其他错误（网络等）也认为登录成功，继续执行
+        return;
+      }
+    } catch (_) {}
   }
-  throw lastErr;
+  throw new Error('登录失败: 请检查 CPE_USER / CPE_PASS 配置');
 }
 
 // ==================== 数据获取 ====================
@@ -355,14 +350,18 @@ async function fetchAllData(ctx, cfg) {
   // 确保 API base 已检测
   if (!cfg._apiBase) await detectApiBase(ctx, cfg);
 
-  // 检查是否需要登录
-  const loggedIn = await isLoggedIn(ctx, cfg);
-  if (!loggedIn) await login(ctx, cfg);
-
-  // GET header_info（基础数据：流量、信号格、运营商）
   const base = cfg._apiBase;
+
+  // 直接尝试获取数据；若需要登录再登录（避免依赖 IS_LOGGED_IN 端点）
   let h = {};
-  try { h = await fhGet(ctx, cfg, `${base}/FHAPIS?ajaxmethod=get_header_info`); } catch (_) {}
+  try {
+    h = await fhGet(ctx, cfg, `${base}/FHAPIS?ajaxmethod=get_header_info`);
+  } catch (e) {
+    if (e.message === 'AUTH_REQUIRED') {
+      await login(ctx, cfg);
+      try { h = await fhGet(ctx, cfg, `${base}/FHAPIS?ajaxmethod=get_header_info`); } catch (_) {}
+    }
+  }
 
   // POST 获取 NR 信号详情（多个候选方法名，取第一个成功的）
   let nr = {};
